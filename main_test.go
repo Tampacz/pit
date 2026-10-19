@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -66,6 +67,25 @@ func TestFindPatreon(t *testing.T) {
 	}
 	if p, ok := findPatreon("2026-07"); ok || p.file == "" {
 		t.Errorf("a month without a row must report the file but no data: %+v, %v", p, ok)
+	}
+}
+
+func TestFetchRatesSplitsLongSpans(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		fmt.Fprint(w, `{"rates": [{"effectiveDate": "2026-01-02", "mid": 3.6}]}`)
+	}))
+	defer srv.Close()
+	nbpAPI = srv.URL + "/"
+
+	from, to := time.Date(2025, 12, 22, 0, 0, 0, 0, warsaw), time.Date(2026, 12, 31, 0, 0, 0, 0, warsaw) // a year plus margin
+	if got := fetchRates("USD", from, to); len(got) != 2 {
+		t.Errorf("got %d rates, want one per request", len(got))
+	}
+	want := []string{"/exchangerates/rates/a/usd/2025-12-22/2026-06-27/", "/exchangerates/rates/a/usd/2026-06-28/2026-12-31/"}
+	if !slices.Equal(asked, want) {
+		t.Errorf("asked NBP for %v, want %v", asked, want)
 	}
 }
 

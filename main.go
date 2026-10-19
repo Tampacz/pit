@@ -20,7 +20,7 @@
 //
 // The key comes from STRIPE_SECRET_KEY in the environment or in ./.env; a restricted key with Read
 // on "Balance Transaction Sources", "Charges and Refunds" and "Payment Disputes" is enough.
-// Usage: go run . 2026-09
+// Usage: go run . [RRRR-MM] for a month (default: the previous one), go run . RRRR for the annual summary.
 package main
 
 import (
@@ -62,6 +62,7 @@ var (
 	}()
 	client    = &http.Client{Timeout: 30 * time.Second}
 	stripeAPI = "https://api.stripe.com/v1/" // swapped in tests
+	nbpAPI    = "https://api.nbp.pl/api/"    // swapped in tests
 
 	// EU member states other than Poland.
 	eu = strings.Fields("AT BE BG CY CZ DE DK EE ES FI FR GR HR HU IE IT LT LU LV MT NL PT RO SE SI SK")
@@ -140,10 +141,18 @@ func (s *sum) add(e entry) {
 func main() {
 	log.SetFlags(0)
 	key := secret("STRIPE_SECRET_KEY")
-	if len(os.Args) != 2 || key == "" {
-		log.Fatal("użycie: go run . RRRR-MM (klucz Stripe w STRIPE_SECRET_KEY, w środowisku albo w .env)")
+	now := time.Now().In(warsaw)
+	month := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, warsaw).AddDate(0, -1, 0).Format("2006-01")
+	if len(os.Args) == 2 {
+		month = os.Args[1]
 	}
-	month := os.Args[1]
+	if len(os.Args) > 2 || key == "" {
+		log.Fatal("użycie: go run . [RRRR-MM | RRRR] (bez argumentu: poprzedni miesiąc; klucz Stripe w STRIPE_SECRET_KEY, w środowisku albo w .env)")
+	}
+	if len(month) == 4 {
+		runYear(key, month)
+		return
+	}
 	start, err := time.ParseInLocation("2006-01", month, warsaw)
 	if err != nil {
 		log.Fatal(err)
@@ -154,29 +163,10 @@ func main() {
 		fmt.Printf("UWAGA: %s jeszcze trwa, dane są niepełne.\n\n", month)
 	}
 
-	// Last year and this year so far feed the VAT thresholds; only the month is converted and written.
-	// ponytail: thresholds sum Stripe's PLN, within ~0.3% of NBP, enough to see them coming
-	var entries []entry
-	var euLastYear, euThisYear, plThisYear int64
-	soldLastYear, firstSale := false, end
+	// Last year and this year so far feed the VAT thresholds and the tax check; only the month is written.
 	all, fees := fetchEntries(key, yearStart.AddDate(-1, 0, 0), end)
+	var entries []entry
 	for _, e := range all {
-		if e.at.Before(yearStart) {
-			soldLastYear = true
-			if region(e.country) == "UE" {
-				euLastYear += e.stripePLN
-			}
-			continue
-		}
-		if e.at.Before(firstSale) {
-			firstSale = e.at
-		}
-		switch region(e.country) {
-		case "UE":
-			euThisYear += e.stripePLN
-		case "Polska":
-			plThisYear += e.stripePLN
-		}
 		if !e.at.Before(start) {
 			entries = append(entries, e)
 		}
@@ -185,29 +175,7 @@ func main() {
 		log.Fatalf("brak płatności w %s", month)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
-
-	// A refund is corrected at the rate of the sale it reverses, so rates start before the oldest sale.
-	first, last := entries[0].sold, entries[0].sold
-	for _, e := range entries {
-		if e.sold.Before(first) {
-			first = e.sold
-		}
-		if e.sold.After(last) {
-			last = e.sold
-		}
-	}
-	rates := map[string][]rate{}
-	for i := range entries {
-		e := &entries[i]
-		if rates[e.currency] == nil {
-			rates[e.currency] = fetchRates(e.currency, day(first.AddDate(0, 0, -10)), day(last))
-		}
-		r, err := rateBefore(rates[e.currency], day(e.sold))
-		if err != nil {
-			log.Fatal(err)
-		}
-		e.rate, e.pln = r, toPLN(e.amount, e.currency, r.Mid)
-	}
+	convert(entries)
 
 	var total sum
 	daily, byMethod, byRegion := map[string]*sum{}, map[string]*sum{}, map[string]*sum{}
@@ -247,20 +215,7 @@ func main() {
 	}
 	printSum("razem", &total)
 
-	fmt.Printf("\nKonsumenci z UE poza Polską od 1 stycznia: %s zł z progu %s zł (10 000 euro)\n", money(euThisYear), money(euThreshold))
-	domestic := plThisYear + euThisYear // ponytail: keeps EU sales past the EU threshold in, which only warns earlier
-	switch {
-	case euLastYear > euThreshold:
-		fmt.Println("UWAGA: próg UE przekroczony w zeszłym roku, więc od 1 stycznia sprzedaż do UE podlega VAT w kraju klienta (OSS).")
-		domestic = plThisYear
-	case euThisYear*10 >= euThreshold*8:
-		fmt.Println("UWAGA: ponad 80% progu UE. Powyżej VAT płaci się w kraju klienta (OSS), ustal to z księgową.")
-	}
-	limit, prorated := exemptionLimitFor(soldLastYear, firstSale, yearStart)
-	fmt.Printf("Sprzedaż w Polsce (PL i UE do progu) od 1 stycznia: %s zł z limitu zwolnienia z VAT %s zł%s\n", money(domestic), money(limit), prorated)
-	if domestic*10 >= limit*8 {
-		fmt.Println("UWAGA: ponad 80% limitu zwolnienia z VAT. Po jego przekroczeniu trzeba się zarejestrować jako czynny podatnik VAT.")
-	}
+	printVATThresholds(all, yearStart)
 
 	patreon, ok := findPatreon(month)
 	switch {
@@ -281,13 +236,7 @@ func main() {
 		money(total.pln), money(total.stripe-total.pln), money(patreon.revenue), money(total.stripe+patreon.revenue))
 
 	// A rough check of the month's taxes on the tax scale, to compare with the accountant's figures.
-	cumStart, err := time.ParseInLocation("2006-01", jdgStart, warsaw)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if cumStart.Before(yearStart) {
-		cumStart = yearStart
-	}
+	cumStart := taxYearStart(yearStart)
 	if start.Before(cumStart) {
 		fmt.Printf("\n%s to działalność nierejestrowana: przychód wchodzi do rocznego PIT, bez zaliczek.\n", month)
 	} else {
@@ -318,6 +267,159 @@ func main() {
 		fmt.Println("  " + f)
 	}
 	fmt.Println("  faktura Stripe za prowizje: https://dashboard.stripe.com/settings/plans-and-fees/invoice-history (do 10. dnia następnego miesiąca)")
+}
+
+// runYear writes out/RRRR_roczne.csv for the annual PIT-36: each month's revenue, costs and income, with the months
+// before jdgStart marked as unregistered activity (other sources), and a rough scale tax on the whole year.
+func runYear(key, year string) {
+	yearStart, err := time.ParseInLocation("2006", year, warsaw)
+	if err != nil {
+		log.Fatal(err)
+	}
+	end := yearStart.AddDate(1, 0, 0)
+	if time.Now().Before(end) {
+		fmt.Printf("UWAGA: %s jeszcze trwa, dane są niepełne.\n\n", year)
+	}
+	all, fees := fetchEntries(key, yearStart.AddDate(-1, 0, 0), end)
+	var entries []entry
+	for _, e := range all {
+		if !e.at.Before(yearStart) {
+			entries = append(entries, e)
+		}
+	}
+	convert(entries)
+	costs := readCosts(yearStart, end)
+
+	type total struct{ nbp, fx, patreon, costs, income int64 }
+	periods := map[string]*total{"nierejestrowana": {}, "JDG": {}}
+	rows := [][]string{{"Miesiąc", "Okres", "Przychód Stripe PLN (kurs NBP)", "Różnice kursowe PLN", "Przychód Patreon PLN", "Koszty PLN", "Dochód PLN"}}
+	row := func(label, period string, t *total) []string {
+		return []string{label, period, money(t.nbp), money(t.fx), money(t.patreon), money(t.costs), money(t.income)}
+	}
+	for m := yearStart; m.Before(end); m = m.AddDate(0, 1, 0) {
+		ms := m.Format("2006-01")
+		t := monthTaxFor(ms, entries, fees, costs)
+		if t.stripe == 0 && t.patreon == 0 && t.fees == 0 && t.purchases == 0 {
+			continue
+		}
+		mt := total{patreon: t.patreon, costs: t.fees + t.purchases, income: t.income}
+		for _, e := range entries {
+			if e.at.Format("2006-01") == ms {
+				mt.nbp += e.pln
+			}
+		}
+		mt.fx = t.stripe - mt.nbp
+		period := "JDG"
+		if m.Before(taxYearStart(yearStart)) {
+			period = "nierejestrowana"
+		}
+		rows = append(rows, row(ms, period, &mt))
+		p := periods[period]
+		p.nbp, p.fx, p.patreon, p.costs, p.income = p.nbp+mt.nbp, p.fx+mt.fx, p.patreon+mt.patreon, p.costs+mt.costs, p.income+mt.income
+	}
+
+	fmt.Printf("Rok %s, kurs NBP z dnia roboczego poprzedzającego płatność:\n", year)
+	for _, period := range []string{"nierejestrowana", "JDG"} {
+		p := periods[period]
+		if *p == (total{}) {
+			continue
+		}
+		rows = append(rows, row("RAZEM", period, p))
+		fmt.Printf("  %-15s przychód %s zł (Stripe %s + różnice kursowe %s + Patreon %s), koszty %s zł, dochód %s zł\n",
+			period, money(p.nbp+p.fx+p.patreon), money(p.nbp), money(p.fx), money(p.patreon), money(p.costs), money(p.income))
+	}
+	if periods["nierejestrowana"].income != 0 {
+		fmt.Println("  dochód z działalności nierejestrowanej idzie do PIT-36 jako inne źródła, razem z dochodem z JDG")
+	}
+	tax := pitScale(periods["nierejestrowana"].income + periods["JDG"].income)
+	fmt.Printf("  podatek wg skali od łącznego dochodu (z kwotą zmniejszającą, bez innych dochodów, np. z etatu): %s zł, minus zapłacone zaliczki\n", money(tax))
+	printVATThresholds(all, yearStart)
+
+	if err := os.MkdirAll("out", 0o755); err != nil {
+		log.Fatal(err)
+	}
+	path := filepath.Join("out", year+"_roczne.csv")
+	writeCSV(path, rows)
+	fmt.Printf("\nZapisano %s\n", path)
+}
+
+// taxYearStart is where PIT advances start counting: 1 January, or the JDG start in its first year.
+func taxYearStart(yearStart time.Time) time.Time {
+	jdg, err := time.ParseInLocation("2006-01", jdgStart, warsaw)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if jdg.Before(yearStart) {
+		return yearStart
+	}
+	return jdg
+}
+
+// convert sets each entry's NBP rate from the last business day before its sale and its PLN value.
+// A refund is corrected at the rate of the sale it reverses, so rates start before the oldest sale.
+func convert(entries []entry) {
+	spans := map[string][2]time.Time{}
+	for _, e := range entries {
+		s, ok := spans[e.currency]
+		if !ok || e.sold.Before(s[0]) {
+			s[0] = e.sold
+		}
+		if !ok || e.sold.After(s[1]) {
+			s[1] = e.sold
+		}
+		spans[e.currency] = s
+	}
+	rates := map[string][]rate{}
+	for cur, s := range spans {
+		rates[cur] = fetchRates(cur, s[0].AddDate(0, 0, -10), s[1])
+	}
+	for i := range entries {
+		e := &entries[i]
+		r, err := rateBefore(rates[e.currency], day(e.sold))
+		if err != nil {
+			log.Fatal(err)
+		}
+		e.rate, e.pln = r, toPLN(e.amount, e.currency, r.Mid)
+	}
+}
+
+// printVATThresholds sums sales by VAT area since 1 January (and last year) against the EU threshold and the
+// exemption limit. ponytail: it sums Stripe's PLN, within ~0.3% of NBP, enough to see the thresholds coming.
+func printVATThresholds(all []entry, yearStart time.Time) {
+	var euLastYear, euThisYear, plThisYear int64
+	soldLastYear, firstSale := false, yearStart.AddDate(1, 0, 0)
+	for _, e := range all {
+		if e.at.Before(yearStart) {
+			soldLastYear = true
+			if region(e.country) == "UE" {
+				euLastYear += e.stripePLN
+			}
+			continue
+		}
+		if e.at.Before(firstSale) {
+			firstSale = e.at
+		}
+		switch region(e.country) {
+		case "UE":
+			euThisYear += e.stripePLN
+		case "Polska":
+			plThisYear += e.stripePLN
+		}
+	}
+	fmt.Printf("\nKonsumenci z UE poza Polską od 1 stycznia: %s zł z progu %s zł (10 000 euro)\n", money(euThisYear), money(euThreshold))
+	domestic := plThisYear + euThisYear // ponytail: keeps EU sales past the EU threshold in, which only warns earlier
+	switch {
+	case euLastYear > euThreshold:
+		fmt.Println("UWAGA: próg UE przekroczony w zeszłym roku, więc od 1 stycznia sprzedaż do UE podlega VAT w kraju klienta (OSS).")
+		domestic = plThisYear
+	case euThisYear*10 >= euThreshold*8:
+		fmt.Println("UWAGA: ponad 80% progu UE. Powyżej VAT płaci się w kraju klienta (OSS), ustal to z księgową.")
+	}
+	limit, prorated := exemptionLimitFor(soldLastYear, firstSale, yearStart)
+	fmt.Printf("Sprzedaż w Polsce (PL i UE do progu) od 1 stycznia: %s zł z limitu zwolnienia z VAT %s zł%s\n", money(domestic), money(limit), prorated)
+	if domestic*10 >= limit*8 {
+		fmt.Println("UWAGA: ponad 80% limitu zwolnienia z VAT. Po jego przekroczeniu trzeba się zarejestrować jako czynny podatnik VAT.")
+	}
 }
 
 // monthTax is one month's income on the tax scale, in grosze. Stripe counts at the PLN it credited, which
@@ -385,7 +487,7 @@ func readCosts(from, to time.Time) []cost {
 		}
 		c := cost{day: d, pln: cents(r[2]), imported: r[4] == "tak"}
 		if cur := strings.ToUpper(r[3]); cur != "PLN" {
-			rt, err := rateBefore(fetchRates(cur, day(d.AddDate(0, 0, -10)), day(d)), day(d))
+			rt, err := rateBefore(fetchRates(cur, d.AddDate(0, 0, -10), d), day(d))
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -607,9 +709,15 @@ func secret(name string) string {
 	return ""
 }
 
-func fetchRates(code, from, to string) []rate {
+// fetchRates returns NBP table A mid rates for [from, to] in date order. NBP answers at most 367 days at once,
+// so longer spans are fetched in halves.
+func fetchRates(code string, from, to time.Time) []rate {
+	if to.Sub(from) > 300*24*time.Hour {
+		mid := from.Add(to.Sub(from) / 2)
+		return append(fetchRates(code, from, mid), fetchRates(code, mid.AddDate(0, 0, 1), to)...)
+	}
 	var body struct{ Rates []rate }
-	getJSON(fmt.Sprintf("https://api.nbp.pl/api/exchangerates/rates/a/%s/%s/%s/?format=json", strings.ToLower(code), from, to), "", &body)
+	getJSON(fmt.Sprintf("%sexchangerates/rates/a/%s/%s/%s/?format=json", nbpAPI, strings.ToLower(code), day(from), day(to)), "", &body)
 	return body.Rates
 }
 
