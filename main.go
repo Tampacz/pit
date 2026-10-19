@@ -253,7 +253,6 @@ func main() {
 		fmt.Println("UWAGA: ponad 80% limitu zwolnienia z VAT. Po jego przekroczeniu trzeba się zarejestrować jako czynny podatnik VAT.")
 	}
 
-	files := []string{txPath, dayPath}
 	patreon, ok := findPatreon(month)
 	switch {
 	case ok:
@@ -262,7 +261,6 @@ func main() {
 			{"Miesiąc", "Przychód PLN (brutto po zwrotach)", "Prowizje Patreon PLN", "Netto PLN", "Źródło"},
 			{month, money(patreon.revenue), money(patreon.costs), money(patreon.net), filepath.Base(patreon.file)},
 		})
-		files = append(files, path)
 		fmt.Printf("\nPatreon %s: przychód %s zł (prowizje %s zł, netto %s zł)\n", month, money(patreon.revenue), money(patreon.costs), money(patreon.net))
 	case patreon.file == "":
 		fmt.Printf("\nPatreon: brak eksportu w Pobranych. Wyeksportuj go: %s → Export data (CSV przyjdzie mailem).\n", patreonInsights)
@@ -273,7 +271,9 @@ func main() {
 	fmt.Printf("Przychód %s razem: Stripe %s zł + różnice kursowe %s zł + Patreon %s zł = %s zł\n", month,
 		money(total.pln), money(total.stripe-total.pln), money(patreon.revenue), money(total.stripe+patreon.revenue))
 
+	// Anything else saved as out/RRRR-MM_* (e.g. purchase invoices) goes into the same package.
 	fmt.Println("\nDo wysłania księgowej:")
+	files, _ := filepath.Glob(filepath.Join("out", month+"_*"))
 	for _, f := range files {
 		fmt.Println("  " + f)
 	}
