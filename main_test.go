@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -42,6 +44,23 @@ func TestRatesAndDates(t *testing.T) {
 	}
 	if got := day(time.Date(2026, 8, 31, 22, 30, 0, 0, time.UTC).In(warsaw)); got != "2026-09-01" { // already September in Warsaw
 		t.Errorf("Warsaw day = %s", got)
+	}
+}
+
+func TestFindPatreon(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	os.Mkdir(filepath.Join(home, "Downloads"), 0o755)
+	csv := "Month – successful transactions,Currency,Total gross earnings,Patreon platform fees,Total payment processing fees," +
+		"Merch costs (items + delivery),Refunds,Patreon adjustments,Recovered payments,Total net earnings\n" +
+		"2026-09,PLN,299.34,-29.95,-28.78,0.00,-10.00,0.00,0.00,230.61\n"
+	os.WriteFile(filepath.Join(home, "Downloads", "patreon_earnings_breakdown_by_month_2026-05-01_to_2026-10-19.csv"), []byte(csv), 0o644)
+
+	if p, ok := findPatreon("2026-09"); !ok || p.revenue != 28934 || p.costs != -5873 || p.net != 23061 {
+		t.Errorf("findPatreon = %+v, %v", p, ok)
+	}
+	if p, ok := findPatreon("2026-07"); ok || p.file == "" {
+		t.Errorf("a month without a row must report the file but no data: %+v, %v", p, ok)
 	}
 }
 

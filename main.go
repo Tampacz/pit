@@ -11,6 +11,9 @@
 // subject exemption limit of 240 000 zł, prorated by days in the year sales start (art. 113).
 // Patreon sales are outside both: they are services to Patreon, Inc. in the USA.
 //
+// Patreon has no API for earnings, so its row for the month comes from the newest earnings export in
+// ~/Downloads (Insights → Earnings → Export data; Patreon emails the CSV), already in PLN.
+//
 // The key comes from STRIPE_SECRET_KEY in the environment or in ./.env; a restricted key with Read
 // on "Balance Transaction Sources", "Charges and Refunds" and "Payment Disputes" is enough.
 // Usage: go run . 2026-09
@@ -38,8 +41,9 @@ import (
 )
 
 const (
-	euThreshold    = 42_000_00  // grosze
-	exemptionLimit = 240_000_00 // grosze
+	euThreshold     = 42_000_00  // grosze
+	exemptionLimit  = 240_000_00 // grosze
+	patreonInsights = "https://www.patreon.com/insights/earnings"
 )
 
 var (
@@ -138,6 +142,9 @@ func main() {
 	}
 	end := start.AddDate(0, 1, 0)
 	yearStart := time.Date(start.Year(), 1, 1, 0, 0, 0, 0, warsaw)
+	if time.Now().Before(end) {
+		fmt.Printf("UWAGA: %s jeszcze trwa, dane są niepełne.\n\n", month)
+	}
 
 	// Last year and this year so far feed the VAT thresholds; only the month is converted and written.
 	// ponytail: thresholds sum Stripe's PLN, within ~0.3% of NBP, enough to see them coming
@@ -245,7 +252,110 @@ func main() {
 	if domestic*10 >= limit*8 {
 		fmt.Println("UWAGA: ponad 80% limitu zwolnienia z VAT. Po jego przekroczeniu trzeba się zarejestrować jako czynny podatnik VAT.")
 	}
-	fmt.Printf("\nZapisano %s i %s\n", txPath, dayPath)
+
+	files := []string{txPath, dayPath}
+	patreon, ok := findPatreon(month)
+	switch {
+	case ok:
+		path := filepath.Join("out", month+"_patreon.csv")
+		writeCSV(path, [][]string{
+			{"Miesiąc", "Przychód PLN (brutto po zwrotach)", "Prowizje Patreon PLN", "Netto PLN", "Źródło"},
+			{month, money(patreon.revenue), money(patreon.costs), money(patreon.net), filepath.Base(patreon.file)},
+		})
+		files = append(files, path)
+		fmt.Printf("\nPatreon %s: przychód %s zł (prowizje %s zł, netto %s zł)\n", month, money(patreon.revenue), money(patreon.costs), money(patreon.net))
+	case patreon.file == "":
+		fmt.Printf("\nPatreon: brak eksportu w Pobranych. Wyeksportuj go: %s → Export data (CSV przyjdzie mailem).\n", patreonInsights)
+	default:
+		fmt.Printf("\nPatreon: brak %s w %s. Jeśli nie było wpływów, to w porządku; inaczej wyeksportuj ponownie: %s\n",
+			month, filepath.Base(patreon.file), patreonInsights)
+	}
+	fmt.Printf("Przychód %s razem: Stripe %s zł + różnice kursowe %s zł + Patreon %s zł = %s zł\n", month,
+		money(total.pln), money(total.stripe-total.pln), money(patreon.revenue), money(total.stripe+patreon.revenue))
+
+	fmt.Println("\nDo wysłania księgowej:")
+	for _, f := range files {
+		fmt.Println("  " + f)
+	}
+	fmt.Println("  faktura Stripe za prowizje: Stripe → Settings → Documents (do 10. dnia następnego miesiąca)")
+}
+
+type patreonMonth struct {
+	file                string
+	revenue, costs, net int64 // grosze
+}
+
+// findPatreon reads month from the newest Patreon earnings export in ~/Downloads; ok is false without a row for it.
+func findPatreon(month string) (p patreonMonth, ok bool) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal(err)
+	}
+	exports, _ := filepath.Glob(filepath.Join(home, "Downloads", "patreon_earnings_breakdown_by_month_*.csv"))
+	var newest time.Time
+	for _, f := range exports {
+		if fi, err := os.Stat(f); err == nil && fi.ModTime().After(newest) {
+			p.file, newest = f, fi.ModTime()
+		}
+	}
+	if p.file == "" {
+		return p, false
+	}
+	recs := readCSV(p.file)
+	col := map[string]int{}
+	for i, h := range recs[0] {
+		col[h] = i
+	}
+	for _, r := range recs[1:] {
+		if r[0] != month { // first column: "Month – successful transactions"
+			continue
+		}
+		field := func(name string) string {
+			i, ok := col[name]
+			if !ok {
+				log.Fatalf("%s: brak kolumny %q, Patreon zmienił format eksportu", p.file, name)
+			}
+			return r[i]
+		}
+		amount := func(names ...string) (sum int64) {
+			for _, n := range names {
+				sum += cents(field(n))
+			}
+			return sum
+		}
+		if c := field("Currency"); c != "PLN" {
+			log.Fatalf("%s: waluta %s, oczekiwano PLN", p.file, c)
+		}
+		p.revenue = amount("Total gross earnings", "Refunds", "Patreon adjustments", "Recovered payments")
+		p.costs = amount("Patreon platform fees", "Total payment processing fees", "Merch costs (items + delivery)")
+		p.net = amount("Total net earnings")
+		if p.revenue+p.costs != p.net {
+			log.Fatalf("%s: kolumny za %s nie sumują się do netto, sprawdź eksport", p.file, month)
+		}
+		return p, true
+	}
+	return p, false
+}
+
+func readCSV(path string) [][]string {
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	recs, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return recs
+}
+
+func cents(s string) int64 {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		log.Fatalf("kwota %q: %v", s, err)
+	}
+	return int64(math.Round(f * 100))
 }
 
 // exemptionLimitFor is the subject VAT exemption limit, prorated by days in the year sales start (art. 113 ust. 9).
