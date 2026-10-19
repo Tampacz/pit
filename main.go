@@ -277,7 +277,7 @@ func main() {
 	for _, f := range files {
 		fmt.Println("  " + f)
 	}
-	fmt.Println("  faktura Stripe za prowizje: Stripe → Settings → Documents (do 10. dnia następnego miesiąca)")
+	fmt.Println("  faktura Stripe za prowizje: https://dashboard.stripe.com/settings/plans-and-fees/invoice-history (do 10. dnia następnego miesiąca)")
 }
 
 type patreonMonth struct {
