@@ -14,6 +14,10 @@
 // Patreon has no API for earnings, so its row for the month comes from the newest earnings export in
 // ~/Downloads (Insights → Earnings → Export data; Patreon emails the CSV), already in PLN.
 //
+// The summary ends with a rough check of the month's taxes on the tax scale (PIT advance, health
+// contribution, VAT-9M) to sanity-check the accountant's figures. Purchase invoices for it go into
+// ./koszty.csv as data,opis,kwota,waluta,import, with import "tak" when the invoice has no VAT.
+//
 // The key comes from STRIPE_SECRET_KEY in the environment or in ./.env; a restricted key with Read
 // on "Balance Transaction Sources", "Charges and Refunds" and "Payment Disputes" is enough.
 // Usage: go run . 2026-09
@@ -43,6 +47,8 @@ import (
 const (
 	euThreshold     = 42_000_00  // grosze
 	exemptionLimit  = 240_000_00 // grosze
+	minHealth       = 432_54     // grosze; ponytail: minimum for Feb 2026 – Jan 2027, update every February
+	jdgStart        = "2026-09"  // first month booked as JDG; earlier months were unregistered activity
 	patreonInsights = "https://www.patreon.com/insights/earnings"
 )
 
@@ -88,11 +94,13 @@ type stripeCharge struct {
 }
 
 type balanceTx struct {
-	ID       string `json:"id"`
-	Amount   int64  `json:"amount"`
-	Currency string `json:"currency"`
-	Created  int64  `json:"created"`
-	Source   *struct {
+	ID                string `json:"id"`
+	Amount            int64  `json:"amount"`
+	Fee               int64  `json:"fee"`
+	Currency          string `json:"currency"`
+	Created           int64  `json:"created"`
+	ReportingCategory string `json:"reporting_category"`
+	Source            *struct {
 		stripeCharge
 		Object   string `json:"object"`
 		Amount   int64  `json:"amount"`
@@ -151,7 +159,8 @@ func main() {
 	var entries []entry
 	var euLastYear, euThisYear, plThisYear int64
 	soldLastYear, firstSale := false, end
-	for _, e := range fetchEntries(key, yearStart.AddDate(-1, 0, 0), end) {
+	all, fees := fetchEntries(key, yearStart.AddDate(-1, 0, 0), end)
+	for _, e := range all {
 		if e.at.Before(yearStart) {
 			soldLastYear = true
 			if region(e.country) == "UE" {
@@ -271,6 +280,37 @@ func main() {
 	fmt.Printf("Przychód %s razem: Stripe %s zł + różnice kursowe %s zł + Patreon %s zł = %s zł\n", month,
 		money(total.pln), money(total.stripe-total.pln), money(patreon.revenue), money(total.stripe+patreon.revenue))
 
+	// A rough check of the month's taxes on the tax scale, to compare with the accountant's figures.
+	cumStart, err := time.ParseInLocation("2006-01", jdgStart, warsaw)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if cumStart.Before(yearStart) {
+		cumStart = yearStart
+	}
+	if start.Before(cumStart) {
+		fmt.Printf("\n%s to działalność nierejestrowana: przychód wchodzi do rocznego PIT, bez zaliczek.\n", month)
+	} else {
+		costs := readCosts(cumStart, end)
+		var t monthTax
+		var before, cum int64 // income since cumStart up to the previous month and up to this one
+		for m := cumStart; m.Before(end); m = m.AddDate(0, 1, 0) {
+			t = monthTaxFor(m.Format("2006-01"), all, fees, costs)
+			before, cum = cum, cum+t.income
+		}
+		pit := pitScale(cum) - pitScale(before)
+		health := max((t.income*9+50)/100, minHealth)
+		vat := ((t.fees+t.imported)*23 + 5000) / 10000 * 100 // full złoty
+		fmt.Printf("\nKontrolka %s (szacunek do porównania z księgową, nie zastępuje jej):\n", month)
+		fmt.Printf("  przychód  %s zł (Stripe z różnicami kursowymi %s, Patreon %s)\n", money(t.stripe+t.patreon), money(t.stripe), money(t.patreon))
+		fmt.Printf("  koszty    %s zł (prowizje Stripe i Patreon %s, faktury z koszty.csv %s)\n", money(t.fees+t.purchases), money(t.fees), money(t.purchases))
+		fmt.Printf("  dochód    %s zł (od %s narastająco %s zł)\n", money(t.income), cumStart.Format("2006-01"), money(cum))
+		fmt.Printf("  zaliczka PIT (skala, z kwotą zmniejszającą 3 600 zł): %s zł do 20. dnia następnego miesiąca\n", money(pit))
+		fmt.Printf("  składka zdrowotna od tego dochodu (9%%, min. %s zł): %s zł w ZUS za następny miesiąc\n", money(minHealth), money(health))
+		fmt.Printf("  VAT-9M (import usług, najwyżej 23%% od prowizji i faktur bez VAT): %s zł do 25. dnia następnego miesiąca\n", money(vat))
+		fmt.Println("  założenia: prowizje Stripe w miesiącu pobrania, bez składek społecznych (ulga na start)")
+	}
+
 	// Anything else saved as out/RRRR-MM_* (e.g. purchase invoices) goes into the same package.
 	fmt.Println("\nDo wysłania księgowej:")
 	files, _ := filepath.Glob(filepath.Join("out", month+"_*"))
@@ -278,6 +318,82 @@ func main() {
 		fmt.Println("  " + f)
 	}
 	fmt.Println("  faktura Stripe za prowizje: https://dashboard.stripe.com/settings/plans-and-fees/invoice-history (do 10. dnia następnego miesiąca)")
+}
+
+// monthTax is one month's income on the tax scale, in grosze. Stripe counts at the PLN it credited, which
+// equals revenue at the NBP rate plus the exchange-rate differences.
+type monthTax struct {
+	stripe, patreon int64 // revenue
+	fees, purchases int64 // Stripe and Patreon fees; invoices from koszty.csv
+	imported        int64 // the part of purchases that is import of services (VAT-9M)
+	income          int64
+}
+
+func monthTaxFor(month string, all []entry, stripeFees map[string]int64, costs []cost) monthTax {
+	t := monthTax{fees: stripeFees[month]}
+	for _, e := range all {
+		if e.at.Format("2006-01") == month {
+			t.stripe += e.stripePLN
+		}
+	}
+	if p, ok := findPatreon(month); ok {
+		t.patreon, t.fees = p.revenue, t.fees-p.costs
+	}
+	for _, c := range costs {
+		if c.day.Format("2006-01") == month {
+			t.purchases += c.pln
+			if c.imported {
+				t.imported += c.pln
+			}
+		}
+	}
+	t.income = t.stripe + t.patreon - t.fees - t.purchases
+	return t
+}
+
+// pitScale is the tax-scale PIT on income since 1 January after the 3 600 zł reducing amount, in grosze;
+// the base and the tax are rounded to full złoty.
+func pitScale(income int64) int64 {
+	base := (income + 50) / 100
+	tax := (base*12 + 50) / 100
+	if base > 120_000 {
+		tax = 14_400 + ((base-120_000)*32+50)/100
+	}
+	return max(tax-3_600, 0) * 100
+}
+
+type cost struct {
+	day      time.Time
+	pln      int64 // grosze
+	imported bool  // no VAT on the invoice: import of services, VAT-9M is due
+}
+
+// readCosts reads purchase invoices dated in [from, to) from ./koszty.csv, converting foreign ones at the NBP rate
+// from the business day before the invoice date (art. 11a). No file means no invoices.
+func readCosts(from, to time.Time) []cost {
+	if _, err := os.Stat("koszty.csv"); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	var costs []cost
+	for _, r := range readCSV("koszty.csv")[1:] { // data,opis,kwota,waluta,import
+		d, err := time.ParseInLocation("2006-01-02", r[0], warsaw)
+		if err != nil {
+			log.Fatalf("koszty.csv: %v", err)
+		}
+		if d.Before(from) || !d.Before(to) {
+			continue
+		}
+		c := cost{day: d, pln: cents(r[2]), imported: r[4] == "tak"}
+		if cur := strings.ToUpper(r[3]); cur != "PLN" {
+			rt, err := rateBefore(fetchRates(cur, day(d.AddDate(0, 0, -10)), day(d)), day(d))
+			if err != nil {
+				log.Fatal(err)
+			}
+			c.pln = toPLN(c.pln, cur, rt.Mid)
+		}
+		costs = append(costs, c)
+	}
+	return costs
 }
 
 type patreonMonth struct {
@@ -370,10 +486,11 @@ func exemptionLimitFor(soldLastYear bool, firstSale, yearStart time.Time) (int64
 }
 
 // fetchEntries lists the money customers moved (sales, refunds, chargebacks) that hit the Stripe balance in [from, to).
-func fetchEntries(key string, from, to time.Time) []entry {
+func fetchEntries(key string, from, to time.Time) ([]entry, map[string]int64) {
 	q := url.Values{"limit": {"100"}, "expand[]": {"data.source"},
 		"created[gte]": {strconv.FormatInt(from.Unix(), 10)}, "created[lt]": {strconv.FormatInt(to.Unix(), 10)}}
 	var entries []entry
+	fees := map[string]int64{} // per RRRR-MM, including PayPal's fees taken through Stripe
 	for {
 		var page struct {
 			Data    []balanceTx `json:"data"`
@@ -381,10 +498,14 @@ func fetchEntries(key string, from, to time.Time) []entry {
 		}
 		getJSON(stripeAPI+"balance_transactions?"+q.Encode(), key, &page)
 		for _, bt := range page.Data {
+			at := time.Unix(bt.Created, 0).In(warsaw)
+			fees[at.Format("2006-01")] += bt.Fee
+			if bt.ReportingCategory == "fee" { // Billing, Radar and other fees charged on their own
+				fees[at.Format("2006-01")] -= bt.Amount
+			}
 			if bt.Source == nil {
 				continue
 			}
-			at := time.Unix(bt.Created, 0).In(warsaw)
 			e := entry{at: at, sold: at, kind: "sprzedaż", currency: strings.ToUpper(bt.Source.Currency), amount: bt.Source.Amount, stripePLN: bt.Amount}
 			sale := bt.Source.stripeCharge
 			switch bt.Source.Object {
@@ -410,7 +531,7 @@ func fetchEntries(key string, from, to time.Time) []entry {
 			entries = append(entries, e)
 		}
 		if !page.HasMore {
-			return entries
+			return entries, fees
 		}
 		q.Set("starting_after", page.Data[len(page.Data)-1].ID)
 	}

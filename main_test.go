@@ -35,6 +35,11 @@ func TestRatesAndDates(t *testing.T) {
 			t.Errorf("toPLN(%d %s) = %d, want %d", c.minor, c.currency, got, c.want)
 		}
 	}
+	for income, want := range map[int64]int64{30_000_00: 0, 40_000_00: 1_200_00, 130_000_00: 14_000_00, -500_00: 0} {
+		if got := pitScale(income); got != want { // 12% minus 3 600 zł, 32% above 120 000 zł
+			t.Errorf("pitScale(%d) = %d, want %d", income, got, want)
+		}
+	}
 	jan1 := time.Date(2026, 1, 1, 0, 0, 0, 0, warsaw)
 	if got, _ := exemptionLimitFor(false, time.Date(2026, 5, 30, 2, 39, 0, 0, warsaw), jan1); got != 14_202_739 { // 216 of 365 days
 		t.Errorf("prorated limit = %d", got)
@@ -72,11 +77,11 @@ func TestFetchEntries(t *testing.T) {
 		switch r.URL.Path {
 		case "/balance_transactions":
 			fmt.Fprint(w, `{"has_more": false, "data": [
-				{"id": "txn_1", "amount": 3843, "currency": "pln", "created": 1790000000, "source": {"object": "charge", "id": "py_1",
+				{"id": "txn_1", "amount": 3843, "fee": 412, "currency": "pln", "created": 1790000000, "source": {"object": "charge", "id": "py_1",
 					"amount": 999, "currency": "usd", "created": 1790000000, "payment_method_details": {"type": "paypal", "paypal": {"country": "DE"}}}},
 				{"id": "txn_2", "amount": -3800, "currency": "pln", "created": 1792000000, "source": {"object": "refund", "id": "re_1",
 					"amount": 999, "currency": "usd", "charge": "ch_1"}},
-				{"id": "txn_3", "amount": -412, "currency": "pln", "created": 1790000000, "source": null},
+				{"id": "txn_3", "amount": -412, "currency": "pln", "created": 1790000000, "reporting_category": "fee", "source": null},
 				{"id": "txn_4", "amount": -100000, "currency": "pln", "created": 1791000000, "source": {"object": "payout", "id": "po_1"}}]}`)
 		case "/charges/ch_1":
 			fmt.Fprint(w, `{"id": "ch_1", "created": 1789000000, "payment_method_details": {"type": "card", "card": {"country": "US"}}}`)
@@ -87,7 +92,10 @@ func TestFetchEntries(t *testing.T) {
 	defer srv.Close()
 	stripeAPI = srv.URL + "/"
 
-	got := fetchEntries("rk_test", time.Unix(0, 0), time.Unix(2000000000, 0))
+	got, fees := fetchEntries("rk_test", time.Unix(0, 0), time.Unix(2000000000, 0))
+	if fees["2026-09"] != 824 { // the charge's fee plus a fee charged on its own
+		t.Errorf("fees = %v", fees)
+	}
 	if len(got) != 2 {
 		t.Fatalf("got %d entries, want the sale and the refund", len(got))
 	}
